@@ -326,7 +326,6 @@ static void inputSendThreadProc(void* context) {
 
     uint64_t lastControllerPacketTime[MAX_GAMEPADS] = { 0 };
     uint64_t lastMousePacketTime = 0;
-    uint64_t lastPenPacketTime = 0;
 
     while (!PltIsThreadInterrupted(&inputSendThread)) {
         err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
@@ -478,41 +477,6 @@ static void inputSendThreadProc(void* context) {
             PltUnlockMutex(&batchedInputMutex);
 
             lastMousePacketTime = now;
-        }
-        // If it's a pen packet, we should only send the latest move or hover events
-        else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC)) {
-            uint64_t now = PltGetMillis();
-
-            for (;;) {
-                PPACKET_HOLDER penBatchHolder;
-
-                // Peek at the next packet
-                if (LbqPeekQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // If it's not a pen packet, we're done
-                if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
-                    break;
-                }
-
-                // If the buttons or event type is different, we cannot batch
-                if (holder->packet.pen.penButtons != penBatchHolder->packet.pen.penButtons ||
-                    holder->packet.pen.eventType != penBatchHolder->packet.pen.eventType) {
-                    break;
-                }
-
-                // Remove the next packet
-                if (LbqPollQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // Replace the current packet with the new one
-                freePacketHolder(holder);
-                holder = penBatchHolder;
-            }
-
-            lastPenPacketTime = now;
         }
         // If it's a motion packet, only send the latest for each sensor type
         else if (holder->packet.header.magic == LE32(SS_CONTROLLER_MOTION_MAGIC)) {
