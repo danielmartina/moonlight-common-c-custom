@@ -4,8 +4,6 @@ static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
 static bool initialized;
 static bool encryptedControlStream;
-static bool needsBatchedScroll;
-static int batchedScrollDelta;
 static PPLT_CRYPTO_CONTEXT cryptoContext;
 
 static LINKED_BLOCKING_QUEUE packetQueue;
@@ -23,7 +21,6 @@ static float absCurrentPosY;
 
 static uint8_t currentPenButtonState;
 
-static PLT_MUTEX batchedInputMutex;
 static struct {
     float x, y, z;
     bool dirty; // Update ready to send (queued packet holder in packetQueue)
@@ -50,17 +47,6 @@ static struct {
 
 // Matches Win32 WHEEL_DELTA definition
 #define LI_WHEEL_DELTA 120
-
-// If we try to send more than one gamepad or mouse motion event
-// per millisecond, we'll wait a little bit to try to batch with
-// the next one. This batching wait paradoxically _decreases_
-// effective input latency by avoiding packet queuing in ENet.
-#define CONTROLLER_BATCHING_INTERVAL_MS 1
-#define MOUSE_BATCHING_INTERVAL_MS 1
-#define PEN_BATCHING_INTERVAL_MS 1
-
-// Don't batch up/down/cancel events
-#define TOUCH_EVENT_IS_BATCHABLE(x) ((x) == LI_TOUCH_EVENT_HOVER || (x) == LI_TOUCH_EVENT_MOVE)
 
 // Contains input stream packets
 typedef struct _PACKET_HOLDER {
@@ -104,14 +90,6 @@ int initializeInputStream(void) {
     cryptoContext = PltCreateCryptoContext();
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
-    // FIXME: Unsure if this is exactly right, but it's probably good enough.
-    //
-    // GFE 3.13.1.30 is not using NVVHCI for mouse/keyboard (and is confirmed unaffected)
-    // GFE 3.15.0.164 seems to be the first release using NVVHCI for mouse/keyboard
-    //
-    // Sunshine also uses SendInput() so it's not affected either.
-    needsBatchedScroll = APP_VERSION_AT_LEAST(7, 1, 409) && !IS_SUNSHINE();
-    batchedScrollDelta = 0;
 
     currentPenButtonState = 0;
 
@@ -121,7 +99,6 @@ int initializeInputStream(void) {
     memset(currentGamepadSensorState, 0, sizeof(currentGamepadSensorState));
     memset(&currentRelativeMouseState, 0, sizeof(currentRelativeMouseState));
     memset(&currentAbsoluteMouseState, 0, sizeof(currentAbsoluteMouseState));
-    PltCreateMutex(&batchedInputMutex);
 
     return 0;
 }
@@ -154,7 +131,6 @@ void destroyInputStream(void) {
         entry = nextEntry;
     }
 
-    PltDeleteMutex(&batchedInputMutex);
 }
 
 static int encryptData(unsigned char* plaintext, int plaintextLen,
@@ -337,7 +313,6 @@ static void inputSendThreadProc(void* context) {
 
     uint64_t lastControllerPacketTime[MAX_GAMEPADS] = { 0 };
     uint64_t lastMousePacketTime = 0;
-    uint64_t lastPenPacketTime = 0;
 
     while (!PltIsThreadInterrupted(&inputSendThread)) {
         err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
@@ -345,250 +320,6 @@ static void inputSendThreadProc(void* context) {
             return;
         }
 
-        // If it's a multi-controller packet we can do batching
-        if (holder->packet.header.magic == multiControllerMagicLE) {
-            PPACKET_HOLDER controllerBatchHolder;
-            PNV_MULTI_CONTROLLER_PACKET origPkt;
-            short controllerNumber = LE16(holder->packet.multiController.controllerNumber);
-            uint64_t now = PltGetMillis();
-
-            LC_ASSERT(controllerNumber < MAX_GAMEPADS);
-
-            // Delay for batching if required
-            if (now < lastControllerPacketTime[controllerNumber] + CONTROLLER_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastControllerPacketTime[controllerNumber] + CONTROLLER_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
-            origPkt = &holder->packet.multiController;
-            for (;;) {
-                PNV_MULTI_CONTROLLER_PACKET newPkt;
-
-                // Peek at the next packet
-                if (LbqPeekQueueElement(&packetQueue, (void**)&controllerBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // If it's not a controller packet, we're done
-                if (controllerBatchHolder->packet.header.magic != multiControllerMagicLE) {
-                    break;
-                }
-
-                // Check if it's able to be batched
-                // NB: GFE does some discarding of gamepad packets received very soon after another.
-                // Thus, this batching is needed for correctness in some cases, as GFE will inexplicably
-                // drop *newer* packets in that scenario. The brokenness can be tested with consecutive
-                // calls to LiSendMultiControllerEvent() with different values for analog sticks (max -> zero).
-                newPkt = &controllerBatchHolder->packet.multiController;
-                if (newPkt->buttonFlags != origPkt->buttonFlags ||
-                    newPkt->buttonFlags2 != origPkt->buttonFlags2 ||
-                    newPkt->controllerNumber != origPkt->controllerNumber ||
-                    newPkt->activeGamepadMask != origPkt->activeGamepadMask) {
-                    // Batching not allowed
-                    break;
-                }
-
-                // Remove the batchable controller packet
-                if (LbqPollQueueElement(&packetQueue, (void**)&controllerBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // Update the original packet
-                origPkt->leftTrigger = newPkt->leftTrigger;
-                origPkt->rightTrigger = newPkt->rightTrigger;
-                origPkt->leftStickX = newPkt->leftStickX;
-                origPkt->leftStickY = newPkt->leftStickY;
-                origPkt->rightStickX = newPkt->rightStickX;
-                origPkt->rightStickY = newPkt->rightStickY;
-
-                // Free the batched packet holder
-                freePacketHolder(controllerBatchHolder);
-            }
-
-            lastControllerPacketTime[controllerNumber] = now;
-        }
-        // If it's a relative mouse move packet, we can also do batching
-        else if (holder->packet.header.magic == relMouseMagicLE) {
-            uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
-            PltLockMutex(&batchedInputMutex);
-
-            // Send as many packets as it takes to get the entire delta through
-            while (currentRelativeMouseState.deltaX != 0 || currentRelativeMouseState.deltaY != 0) {
-                bool more = false;
-
-                if (currentRelativeMouseState.deltaX < INT16_MIN) {
-                    holder->packet.mouseMoveRel.deltaX = BE16(INT16_MIN);
-                    currentRelativeMouseState.deltaX -= INT16_MIN;
-                    more = true;
-                }
-                else if (currentRelativeMouseState.deltaX > INT16_MAX) {
-                    holder->packet.mouseMoveRel.deltaX = BE16(INT16_MAX);
-                    currentRelativeMouseState.deltaX -= INT16_MAX;
-                    more = true;
-                }
-                else {
-                    holder->packet.mouseMoveRel.deltaX = BE16(currentRelativeMouseState.deltaX);
-                    currentRelativeMouseState.deltaX = 0;
-                }
-
-                if (currentRelativeMouseState.deltaY < INT16_MIN) {
-                    holder->packet.mouseMoveRel.deltaY = BE16(INT16_MIN);
-                    currentRelativeMouseState.deltaY -= INT16_MIN;
-                    more = true;
-                }
-                else if (currentRelativeMouseState.deltaY > INT16_MAX) {
-                    holder->packet.mouseMoveRel.deltaY = BE16(INT16_MAX);
-                    currentRelativeMouseState.deltaY -= INT16_MAX;
-                    more = true;
-                }
-                else {
-                    holder->packet.mouseMoveRel.deltaY = BE16(currentRelativeMouseState.deltaY);
-                    currentRelativeMouseState.deltaY = 0;
-                }
-
-                // Don't hold the batching lock while we're doing network I/O
-                PltUnlockMutex(&batchedInputMutex);
-
-                // Encrypt and send the split packet
-                if (!sendInputPacket(holder, more)) {
-                    freePacketHolder(holder);
-                    return;
-                }
-
-                PltLockMutex(&batchedInputMutex);
-            }
-
-            // The state change is no longer pending
-            currentRelativeMouseState.dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
-
-            lastMousePacketTime = now;
-
-            // We sent everything we needed in the loop above, so we can just free the
-            // holder of the original packet and wait for another input event.
-            freePacketHolder(holder);
-            continue;
-        }
-        // If it's an absolute mouse move packet, we should only send the latest
-        else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
-            uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
-            PltLockMutex(&batchedInputMutex);
-
-            // Populate the packet with the latest state
-            holder->packet.mouseMoveAbs.x = BE16(currentAbsoluteMouseState.x);
-            holder->packet.mouseMoveAbs.y = BE16(currentAbsoluteMouseState.y);
-
-            // There appears to be a rounding error in GFE's scaling calculation which prevents
-            // the cursor from reaching the far edge of the screen when streaming at smaller
-            // resolutions with a higher desktop resolution (like streaming 720p with a desktop
-            // resolution of 1080p, or streaming 720p/1080p with a desktop resolution of 4K).
-            // Subtracting one from the reference dimensions seems to work around this issue.
-            holder->packet.mouseMoveAbs.width = BE16(currentAbsoluteMouseState.width - 1);
-            holder->packet.mouseMoveAbs.height = BE16(currentAbsoluteMouseState.height - 1);
-
-            // The state change is no longer pending
-            currentAbsoluteMouseState.dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
-
-            lastMousePacketTime = now;
-        }
-        // If it's a pen packet, we should only send the latest move or hover events
-        else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
-            uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
-            for (;;) {
-                PPACKET_HOLDER penBatchHolder;
-
-                // Peek at the next packet
-                if (LbqPeekQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // If it's not a pen packet, we're done
-                if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
-                    break;
-                }
-
-                // If the buttons or event type is different, we cannot batch
-                if (holder->packet.pen.penButtons != penBatchHolder->packet.pen.penButtons ||
-                    holder->packet.pen.eventType != penBatchHolder->packet.pen.eventType) {
-                    break;
-                }
-
-                // Remove the next packet
-                if (LbqPollQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // Replace the current packet with the new one
-                freePacketHolder(holder);
-                holder = penBatchHolder;
-            }
-
-            lastPenPacketTime = now;
-        }
-        // If it's a motion packet, only send the latest for each sensor type
-        else if (holder->packet.header.magic == LE32(SS_CONTROLLER_MOTION_MAGIC)) {
-            uint8_t controllerNumber = holder->packet.controllerMotion.controllerNumber;
-            uint8_t motionType = holder->packet.controllerMotion.motionType;
-
-            LC_ASSERT(controllerNumber < MAX_GAMEPADS);
-            LC_ASSERT(motionType - 1 < MAX_MOTION_EVENTS);
-
-            PltLockMutex(&batchedInputMutex);
-
-            // LI_MOTION_TYPE_* values are 1-based, so we have to subtract 1 to index into our state array
-            float x = currentGamepadSensorState[controllerNumber][motionType - 1].x;
-            float y = currentGamepadSensorState[controllerNumber][motionType - 1].y;
-            float z = currentGamepadSensorState[controllerNumber][motionType - 1].z;
-
-            // Motion events are so rapid that we can just drop any events that are lost in transit,
-            // but we will treat (0, 0, 0) as a special value for gyro events to allow clients to
-            // reliably set the gyro to a null state when sensor events are halted due to focus loss
-            // or similar client-side constraints.
-            if (motionType == LI_MOTION_TYPE_GYRO && x == 0.0f && y == 0.0f && z == 0.0f) {
-                holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
-            }
-            else {
-                holder->enetPacketFlags = 0;
-            }
-
-            // Populate the packet with the latest state
-            floatToNetfloat(x, holder->packet.controllerMotion.x);
-            floatToNetfloat(y, holder->packet.controllerMotion.y);
-            floatToNetfloat(z, holder->packet.controllerMotion.z);
-
-            // The state change is no longer pending
-            currentGamepadSensorState[controllerNumber][motionType - 1].dirty = false;
-
-            PltUnlockMutex(&batchedInputMutex);
-        }
         // If it's a UTF-8 text packet, we may need to split it into a several packets to send
         else if (holder->packet.header.magic == LE32(UTF8_TEXT_EVENT_MAGIC)) {
             PACKET_HOLDER splitPacket;
@@ -763,8 +494,6 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
         return 0;
     }
 
-    PltLockMutex(&batchedInputMutex);
-
     // Combine the previous deltas with the new one
     currentRelativeMouseState.deltaX += deltaX;
     currentRelativeMouseState.deltaY += deltaY;
@@ -773,7 +502,6 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
     if (!currentRelativeMouseState.dirty) {
         holder = allocatePacketHolder(0);
         if (holder == NULL) {
-            PltUnlockMutex(&batchedInputMutex);
             return -1;
         }
 
@@ -808,8 +536,6 @@ int LiSendMouseMoveEvent(short deltaX, short deltaY) {
         err = 0;
     }
 
-    PltUnlockMutex(&batchedInputMutex);
-
     return err;
 }
 
@@ -822,8 +548,6 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         return -2;
     }
 
-    PltLockMutex(&batchedInputMutex);
-
     // Overwrite the previous mouse location with the new one
     currentAbsoluteMouseState.x = x;
     currentAbsoluteMouseState.y = y;
@@ -834,7 +558,6 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
     if (!currentAbsoluteMouseState.dirty) {
         holder = allocatePacketHolder(0);
         if (holder == NULL) {
-            PltUnlockMutex(&batchedInputMutex);
             return -1;
         }
 
@@ -863,8 +586,6 @@ int LiSendMousePositionEvent(short x, short y, short referenceWidth, short refer
         // There's already a packet holder queued to send this event
         err = 0;
     }
-
-    PltUnlockMutex(&batchedInputMutex);
 
     // This is not thread safe, but it's not a big deal because callers that want to
     // use LiSendRelativeMotionAsMousePositionEvent() must not mix these function
@@ -1171,83 +892,30 @@ int LiSendHighResScrollEvent(short scrollAmount) {
         return 0;
     }
 
-    // Newer version of GFE that use virtual HID devices have a bug that requires
-    // the scroll events to be batched to WHEEL_DELTA. Due to the their HID report
-    // descriptor, they don't actually support smooth scrolling. _Any_ scroll gets
-    // converted into a full WHEEL_DELTA scroll, even if the actual delta is tiny.
-    // Similarly, large scrolls are capped at +/- WHEEL_DELTA too so we'll need to
-    // split those up too.
-    if (needsBatchedScroll) {
-        if ((batchedScrollDelta < 0 && scrollAmount > 0) ||
-            (batchedScrollDelta > 0 && scrollAmount < 0)) {
-            // Reset the accumulated scroll delta when the direction changes
-            // FIXME: Maybe reset accumulated delta based on time too?
-            batchedScrollDelta = 0;
-        }
+    holder = allocatePacketHolder(0);
+    if (holder == NULL) {
+        return -1;
+    }
 
-        batchedScrollDelta += scrollAmount;
+    holder->channelId = CTRL_CHANNEL_MOUSE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
-        while (abs(batchedScrollDelta) >= LI_WHEEL_DELTA) {
-            scrollAmount = batchedScrollDelta > 0 ? LI_WHEEL_DELTA : -LI_WHEEL_DELTA;
-
-            holder = allocatePacketHolder(0);
-            if (holder == NULL) {
-                return -1;
-            }
-
-            holder->channelId = CTRL_CHANNEL_MOUSE;
-            holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
-
-            holder->packet.scroll.header.size = BE32(sizeof(NV_SCROLL_PACKET) - sizeof(uint32_t));
-            if (AppVersionQuad[0] >= 5) {
-                holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
-            }
-            else {
-                holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
-            }
-            holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
-            holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
-            holder->packet.scroll.zero3 = 0;
-
-            err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-            if (err != LBQ_SUCCESS) {
-                LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-                Limelog("Input queue reached maximum size limit\n");
-                freePacketHolder(holder);
-                return err;
-            }
-
-            batchedScrollDelta -= scrollAmount;
-        }
-
-        err = 0;
+    holder->packet.scroll.header.size = BE32(sizeof(NV_SCROLL_PACKET) - sizeof(uint32_t));
+    if (AppVersionQuad[0] >= 5) {
+        holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
     }
     else {
-        holder = allocatePacketHolder(0);
-        if (holder == NULL) {
-            return -1;
-        }
+        holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
+    }
+    holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
+    holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
+    holder->packet.scroll.zero3 = 0;
 
-        holder->channelId = CTRL_CHANNEL_MOUSE;
-        holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
-
-        holder->packet.scroll.header.size = BE32(sizeof(NV_SCROLL_PACKET) - sizeof(uint32_t));
-        if (AppVersionQuad[0] >= 5) {
-            holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC_GEN5);
-        }
-        else {
-            holder->packet.scroll.header.magic = LE32(SCROLL_MAGIC);
-        }
-        holder->packet.scroll.scrollAmt1 = BE16(scrollAmount);
-        holder->packet.scroll.scrollAmt2 = holder->packet.scroll.scrollAmt1;
-        holder->packet.scroll.zero3 = 0;
-
-        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
-        if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-            Limelog("Input queue reached maximum size limit\n");
-            freePacketHolder(holder);
-        }
+    err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+    if (err != LBQ_SUCCESS) {
+        LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
+        Limelog("Input queue reached maximum size limit\n");
+        freePacketHolder(holder);
     }
 
     return err;
@@ -1325,7 +993,7 @@ int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y, fl
 
     // Allow move and hover events to be dropped if a newer one arrives, but don't allow
     // state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = TOUCH_EVENT_IS_BATCHABLE(eventType) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     holder->packet.touch.header.size = BE32(sizeof(SS_TOUCH_PACKET) - sizeof(uint32_t));
     holder->packet.touch.header.magic = LE32(SS_TOUCH_MAGIC);
@@ -1374,7 +1042,7 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
 
     // Allow move and hover events to be dropped if a newer one arrives (if no buttons changed),
     // but don't allow state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = (TOUCH_EVENT_IS_BATCHABLE(eventType) && !(penButtons ^ currentPenButtonState)) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
     currentPenButtonState = penButtons;
 
     holder->packet.pen.header.size = BE32(sizeof(SS_PEN_PACKET) - sizeof(uint32_t));
@@ -1471,7 +1139,7 @@ int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType, uint
 
     // Allow move and hover events to be dropped if a newer one arrives, but don't allow
     // state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = TOUCH_EVENT_IS_BATCHABLE(eventType) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     holder->packet.controllerTouch.header.size = BE32(sizeof(SS_CONTROLLER_TOUCH_PACKET) - sizeof(uint32_t));
     holder->packet.controllerTouch.header.magic = LE32(SS_CONTROLLER_TOUCH_MAGIC);
@@ -1515,8 +1183,6 @@ int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, fl
     // Sunshine supports up to 16 controllers
     controllerNumber %= MAX_GAMEPADS;
 
-    PltLockMutex(&batchedInputMutex);
-
     currentGamepadSensorState[controllerNumber][motionType - 1].x = x;
     currentGamepadSensorState[controllerNumber][motionType - 1].y = y;
     currentGamepadSensorState[controllerNumber][motionType - 1].z = z;
@@ -1525,7 +1191,6 @@ int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, fl
     if (!currentGamepadSensorState[controllerNumber][motionType - 1].dirty) {
         holder = allocatePacketHolder(0);
         if (holder == NULL) {
-            PltUnlockMutex(&batchedInputMutex);
             return -1;
         }
 
@@ -1554,8 +1219,6 @@ int LiSendControllerMotionEvent(uint8_t controllerNumber, uint8_t motionType, fl
         // There's already a packet holder queued to send this event
         err = 0;
     }
-
-    PltUnlockMutex(&batchedInputMutex);
 
     return err;
 }
