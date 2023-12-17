@@ -51,17 +51,6 @@ static struct {
 // Matches Win32 WHEEL_DELTA definition
 #define LI_WHEEL_DELTA 120
 
-// If we try to send more than one gamepad or mouse motion event
-// per millisecond, we'll wait a little bit to try to batch with
-// the next one. This batching wait paradoxically _decreases_
-// effective input latency by avoiding packet queuing in ENet.
-#define CONTROLLER_BATCHING_INTERVAL_MS 1
-#define MOUSE_BATCHING_INTERVAL_MS 1
-#define PEN_BATCHING_INTERVAL_MS 1
-
-// Don't batch up/down/cancel events
-#define TOUCH_EVENT_IS_BATCHABLE(x) ((x) == LI_TOUCH_EVENT_HOVER || (x) == LI_TOUCH_EVENT_MOVE)
-
 // Contains input stream packets
 typedef struct _PACKET_HOLDER {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
@@ -337,7 +326,6 @@ static void inputSendThreadProc(void* context) {
 
     uint64_t lastControllerPacketTime[MAX_GAMEPADS] = { 0 };
     uint64_t lastMousePacketTime = 0;
-    uint64_t lastPenPacketTime = 0;
 
     while (!PltIsThreadInterrupted(&inputSendThread)) {
         err = LbqWaitForQueueElement(&packetQueue, (void**)&holder);
@@ -353,13 +341,6 @@ static void inputSendThreadProc(void* context) {
             uint64_t now = PltGetMillis();
 
             LC_ASSERT(controllerNumber < MAX_GAMEPADS);
-
-            // Delay for batching if required
-            if (now < lastControllerPacketTime[controllerNumber] + CONTROLLER_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastControllerPacketTime[controllerNumber] + CONTROLLER_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
 
             origPkt = &holder->packet.multiController;
             for (;;) {
@@ -411,13 +392,6 @@ static void inputSendThreadProc(void* context) {
         // If it's a relative mouse move packet, we can also do batching
         else if (holder->packet.header.magic == relMouseMagicLE) {
             uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
 
             PltLockMutex(&batchedInputMutex);
 
@@ -483,13 +457,6 @@ static void inputSendThreadProc(void* context) {
         else if (holder->packet.header.magic == LE32(MOUSE_MOVE_ABS_MAGIC)) {
             uint64_t now = PltGetMillis();
 
-            // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
             PltLockMutex(&batchedInputMutex);
 
             // Populate the packet with the latest state
@@ -510,48 +477,6 @@ static void inputSendThreadProc(void* context) {
             PltUnlockMutex(&batchedInputMutex);
 
             lastMousePacketTime = now;
-        }
-        // If it's a pen packet, we should only send the latest move or hover events
-        else if (holder->packet.header.magic == LE32(SS_PEN_MAGIC) && TOUCH_EVENT_IS_BATCHABLE(holder->packet.pen.eventType)) {
-            uint64_t now = PltGetMillis();
-
-            // Delay for batching if required
-            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
-                flushInputOnControlStream();
-                PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
-                now = PltGetMillis();
-            }
-
-            for (;;) {
-                PPACKET_HOLDER penBatchHolder;
-
-                // Peek at the next packet
-                if (LbqPeekQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // If it's not a pen packet, we're done
-                if (penBatchHolder->packet.header.magic != LE32(SS_PEN_MAGIC)) {
-                    break;
-                }
-
-                // If the buttons or event type is different, we cannot batch
-                if (holder->packet.pen.penButtons != penBatchHolder->packet.pen.penButtons ||
-                    holder->packet.pen.eventType != penBatchHolder->packet.pen.eventType) {
-                    break;
-                }
-
-                // Remove the next packet
-                if (LbqPollQueueElement(&packetQueue, (void**)&penBatchHolder) != LBQ_SUCCESS) {
-                    break;
-                }
-
-                // Replace the current packet with the new one
-                freePacketHolder(holder);
-                holder = penBatchHolder;
-            }
-
-            lastPenPacketTime = now;
         }
         // If it's a motion packet, only send the latest for each sensor type
         else if (holder->packet.header.magic == LE32(SS_CONTROLLER_MOTION_MAGIC)) {
@@ -1324,7 +1249,7 @@ int LiSendTouchEvent(uint8_t eventType, uint32_t pointerId, float x, float y, fl
 
     // Allow move and hover events to be dropped if a newer one arrives, but don't allow
     // state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = TOUCH_EVENT_IS_BATCHABLE(eventType) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     holder->packet.touch.header.size = BE32(sizeof(SS_TOUCH_PACKET) - sizeof(uint32_t));
     holder->packet.touch.header.magic = LE32(SS_TOUCH_MAGIC);
@@ -1373,7 +1298,7 @@ int LiSendPenEvent(uint8_t eventType, uint8_t toolType, uint8_t penButtons,
 
     // Allow move and hover events to be dropped if a newer one arrives (if no buttons changed),
     // but don't allow state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = (TOUCH_EVENT_IS_BATCHABLE(eventType) && !(penButtons ^ currentPenButtonState)) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
     currentPenButtonState = penButtons;
 
     holder->packet.pen.header.size = BE32(sizeof(SS_PEN_PACKET) - sizeof(uint32_t));
@@ -1470,7 +1395,7 @@ int LiSendControllerTouchEvent(uint8_t controllerNumber, uint8_t eventType, uint
 
     // Allow move and hover events to be dropped if a newer one arrives, but don't allow
     // state changing events like up/down/leave events to be dropped.
-    holder->enetPacketFlags = TOUCH_EVENT_IS_BATCHABLE(eventType) ? 0 : ENET_PACKET_FLAG_RELIABLE;
+    holder->enetPacketFlags = ENET_PACKET_FLAG_RELIABLE;
 
     holder->packet.controllerTouch.header.size = BE32(sizeof(SS_CONTROLLER_TOUCH_PACKET) - sizeof(uint32_t));
     holder->packet.controllerTouch.header.magic = LE32(SS_CONTROLLER_TOUCH_MAGIC);
